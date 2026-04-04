@@ -1,0 +1,7 @@
+{
+  "name": "VNS Controller WebApp",
+  "description": "A web-based controller for the VNS Bluetooth device, featuring real-time vital monitoring, DSP filtering, HR estimation, and stimulation control.",
+  "requestFramePermissions": [
+    "bluetooth"
+  ]
+}
