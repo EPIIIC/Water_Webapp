@@ -68,11 +68,11 @@ export default function App() {
   const [lpCut, setLpCut] = useState(3.0);
   const [chkHp, setChkHp] = useState(true);
   const [chkLp, setChkLp] = useState(true);
-  const [filterOrder, setFilterOrder] = useState(2);
+  const [filterOrder, setFilterOrder] = useState(4);
   
   const filters = useRef({
-    ir: new FilterChain(0.5, 3.0, FS, 2),
-    red: new FilterChain(0.5, 3.0, FS, 2)
+    ir: new FilterChain(0.5, 3.0, FS, 4),
+    red: new FilterChain(0.5, 3.0, FS, 4)
   });
 
   // Stimulation State
@@ -98,6 +98,8 @@ export default function App() {
   const lastSeq = useRef(0);
   const overflowCount = useRef(0);
   const samplesSinceCalc = useRef(0);
+  const lastAbsoluteSeq = useRef(-1);
+  const resumeTimeFlag = useRef(false);
 
   // Smoothing
   const emaSpo2 = useRef<number | null>(null);
@@ -300,23 +302,12 @@ export default function App() {
       await tx.startNotifications();
       tx.addEventListener('characteristicvaluechanged', handleData);
 
-      // Clear buffers on new connection to prevent overlapping curves
-      timeBuf.current.fill(NaN);
-      irRawBuf.current.fill(NaN);
-      irFiltBuf.current.fill(NaN);
-      redRawBuf.current.fill(NaN);
-      redFiltBuf.current.fill(NaN);
-      trendTimeBuf.current.fill(NaN);
-      tempBuf.current.fill(NaN);
-      spo2Buf.current.fill(NaN);
-      stimBuf.current.fill(NaN);
-      emaSpo2.current = null;
-      emaHr.current = null;
-      samplesSinceCalc.current = 0;
-      seqOffset.current = 0;
-      lastSeq.current = 0;
-      overflowCount.current = 0;
-      syncTimeFlag.current = true;
+      // Clear all state on new connection
+      clearData();
+      
+      // Automatically start recording
+      setIsRecording(true);
+      isRecordingRef.current = true;
 
       setDevice(dev);
       setStatus("Connected");
@@ -334,6 +325,8 @@ export default function App() {
   };
 
   const handleData = useCallback((event: any) => {
+    if (!isRecordingRef.current) return;
+
     const view = event.target.value;
     
     if (view.byteLength < 96) return; // Expecting at least 96 bytes
@@ -358,7 +351,14 @@ export default function App() {
       lastSeq.current = seq;
       overflowCount.current = 0;
       samplesSinceCalc.current = 0;
+      lastAbsoluteSeq.current = -1;
       syncTimeFlag.current = false;
+      resumeTimeFlag.current = false;
+    } else if (resumeTimeFlag.current) {
+      const target_absolute_seq = lastAbsoluteSeq.current + 1;
+      seqOffset.current = (overflowCount.current * 65536) + seq - target_absolute_seq;
+      lastSeq.current = seq;
+      resumeTimeFlag.current = false;
     }
 
     // Detect 16-bit sequence overflow (wrap-around)
@@ -370,6 +370,7 @@ export default function App() {
 
     // Calculate absolute sequence number
     const absolute_seq = (overflowCount.current * 65536) + seq - seqOffset.current;
+    lastAbsoluteSeq.current = absolute_seq;
     const t0_sec = absolute_seq * (BATCH_SIZE / FS);
 
     const tBatch = new Array(BATCH_SIZE);
@@ -529,22 +530,11 @@ export default function App() {
   }, [stimPw, stimOff]);
 
   const startRecording = () => {
-    syncTimeFlag.current = true;
-    recordedData.current = [];
-    emaSpo2.current = null;
-    emaHr.current = null;
-    signalValid.current = false;
-    
-    timeBuf.current.fill(NaN);
-    irRawBuf.current.fill(NaN);
-    irFiltBuf.current.fill(NaN);
-    redRawBuf.current.fill(NaN);
-    redFiltBuf.current.fill(NaN);
-    trendTimeBuf.current.fill(NaN);
-    spo2Buf.current.fill(NaN);
-    tempBuf.current.fill(NaN);
-    stimBuf.current.fill(NaN);
-    
+    if (lastAbsoluteSeq.current === -1) {
+      syncTimeFlag.current = true;
+    } else {
+      resumeTimeFlag.current = true;
+    }
     setIsRecording(true);
     isRecordingRef.current = true;
   };
@@ -556,6 +546,11 @@ export default function App() {
 
   const clearData = () => {
     syncTimeFlag.current = true;
+    resumeTimeFlag.current = false;
+    lastAbsoluteSeq.current = -1;
+    samplesSinceCalc.current = 0;
+    emaSpo2.current = null;
+    emaHr.current = null;
     recordedData.current = [];
     timeBuf.current.fill(NaN);
     irRawBuf.current.fill(NaN);
@@ -582,12 +577,16 @@ export default function App() {
   };
 
   const saveCsv = () => {
-    if (recordedData.current.length === 0) return;
-    let csvContent = "Time_Sec,Obj_Temp_C,Amb_Temp_C,SpO2_Percent,HR_bpm,Stim_Epoch_Active,Raw_RED,Raw_IR,Filtered_IR\n";
-    recordedData.current.forEach(row => {
-      csvContent += row.join(",") + "\n";
-    });
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    if (recordedData.current.length === 0) {
+      alert("No data recorded. Press 'Record' to gather data before saving.");
+      return;
+    }
+    const headers = "Time_Sec,Obj_Temp_C,Amb_Temp_C,SpO2_Percent,HR_bpm,Stim_Epoch_Active,Raw_RED,Raw_IR,Filtered_IR";
+    const csvContent = [headers];
+    for (let i = 0; i < recordedData.current.length; i++) {
+        csvContent.push(recordedData.current[i].join(","));
+    }
+    const blob = new Blob([csvContent.join("\n")], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.setAttribute("href", url);
@@ -595,15 +594,20 @@ export default function App() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const saveStimCsv = () => {
-    if (stimState.current.events.length === 0) return;
-    let csvContent = "Event,Exact_Time_Sec\n";
+    if (stimState.current.events.length === 0) {
+      alert("No stimulation events recorded.");
+      return;
+    }
+    const headers = "Event,Exact_Time_Sec";
+    const csvContent = [headers];
     stimState.current.events.forEach(row => {
-      csvContent += row.join(",") + "\n";
+      csvContent.push(row.join(","));
     });
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const blob = new Blob([csvContent.join("\n")], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.setAttribute("href", url);
@@ -611,6 +615,7 @@ export default function App() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const applyDspSettings = () => {
@@ -818,28 +823,28 @@ export default function App() {
                     }} className="w-5 h-5 rounded" />
                   </div>
                   
-                  <div className="grid grid-cols-3 gap-4">
-                    <div className="space-y-3 bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
-                      <div className="flex items-center space-x-2">
+                  <div className="grid grid-cols-3 gap-2">
+                    <div className="space-y-2 bg-white p-2 rounded-xl border border-slate-200 shadow-sm">
+                      <div className="flex items-center gap-1">
                         <Checkbox id="hp" checked={chkHp} onChange={(e) => setChkHp(e.target.checked)} className="rounded" />
-                        <Label htmlFor="hp" className="text-xs font-bold text-slate-500 uppercase">HPF (Hz)</Label>
+                        <Label htmlFor="hp" className="text-[10px] md:text-xs font-bold text-slate-500 uppercase whitespace-nowrap">HPF (Hz)</Label>
                       </div>
-                      <Input type="number" step="0.1" value={hpCut} onChange={e => setHpCut(parseFloat(e.target.value))} className="h-10 rounded-lg bg-slate-50 border-slate-200" />
+                      <Input type="number" step="0.1" value={hpCut} onChange={e => setHpCut(parseFloat(e.target.value))} className="h-10 rounded-lg bg-slate-50 border-slate-200 px-2 text-center" />
                     </div>
                     
-                    <div className="space-y-3 bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
-                      <div className="flex items-center space-x-2">
+                    <div className="space-y-2 bg-white p-2 rounded-xl border border-slate-200 shadow-sm">
+                      <div className="flex items-center gap-1">
                         <Checkbox id="lp" checked={chkLp} onChange={(e) => setChkLp(e.target.checked)} className="rounded" />
-                        <Label htmlFor="lp" className="text-xs font-bold text-slate-500 uppercase">LPF (Hz)</Label>
+                        <Label htmlFor="lp" className="text-[10px] md:text-xs font-bold text-slate-500 uppercase whitespace-nowrap">LPF (Hz)</Label>
                       </div>
-                      <Input type="number" step="0.1" value={lpCut} onChange={e => setLpCut(parseFloat(e.target.value))} className="h-10 rounded-lg bg-slate-50 border-slate-200" />
+                      <Input type="number" step="0.1" value={lpCut} onChange={e => setLpCut(parseFloat(e.target.value))} className="h-10 rounded-lg bg-slate-50 border-slate-200 px-2 text-center" />
                     </div>
 
-                    <div className="space-y-3 bg-white p-3 rounded-xl border border-slate-200 shadow-sm">
-                      <div className="flex items-center space-x-2">
-                        <Label htmlFor="order" className="text-xs font-bold text-slate-500 uppercase">Order</Label>
+                    <div className="space-y-2 bg-white p-2 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-between">
+                      <div className="flex items-center gap-1 pt-1">
+                        <Label htmlFor="order" className="text-[10px] md:text-xs font-bold text-slate-500 uppercase whitespace-nowrap">Order</Label>
                       </div>
-                      <Input id="order" type="number" step="1" min="1" max="10" value={filterOrder} onChange={e => setFilterOrder(parseInt(e.target.value) || 2)} className="h-10 rounded-lg bg-slate-50 border-slate-200" />
+                      <Input id="order" type="number" step="1" min="1" max="10" value={filterOrder} onChange={e => setFilterOrder(parseInt(e.target.value) || 2)} className="h-10 rounded-lg bg-slate-50 border-slate-200 px-2 text-center" />
                     </div>
                   </div>
                   <Button onClick={applyDspSettings} className="w-full h-12 rounded-xl bg-slate-800 hover:bg-slate-900 text-white shadow-sm">Apply Parameters</Button>
