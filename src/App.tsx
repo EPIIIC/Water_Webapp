@@ -490,7 +490,7 @@ export default function App() {
       signalValid.current = currentValid;
       
       if (currentValid && emaSpo2.current !== null && emaHr.current !== null) {
-        if (emaSpo2.current > 80.0 && obj_temp > 32.0) {
+        if (emaSpo2.current > 80.0 && obj_temp > 28.0) {
           setUiSpo2(emaSpo2.current.toFixed(1));
           setUiHr(Math.round(emaHr.current).toString());
         } else {
