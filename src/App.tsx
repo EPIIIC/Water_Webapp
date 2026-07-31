@@ -3,7 +3,7 @@ import { Bluetooth, Activity, Thermometer, HeartPulse, Download, Play, Square, S
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardHeader, CardTitle, Button, Input, Label, Checkbox } from './components/ui';
 import { FilterChain } from './utils/filters';
-import { checkSignalQuality, musicHrEstimation, detrend, std, mean } from './utils/dsp';
+import { checkSignalQuality, musicHrEstimation, ppgRmssdAnalysis, detrend, std, mean } from './utils/dsp';
 
 // --- Constants & UUIDs ---
 const SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0";
@@ -16,6 +16,10 @@ const MAX_TIME_WINDOW = 5; // 5 seconds of data for PPG chart
 const TREND_WINDOW = 5; // 5 seconds for trend charts
 const MAX_SAMPLES = MAX_TIME_WINDOW * FS;
 const TREND_SAMPLES = TREND_WINDOW * (FS / BATCH_SIZE);
+const HRV_WINDOW_SECONDS = 30; // Starts immediately, then grows into a more stable rolling estimate
+const HRV_SAMPLES = HRV_WINDOW_SECONDS * FS;
+const MIN_STIM_FREQUENCY_HZ = 0.1;
+const MAX_STIM_FREQUENCY_HZ = 500; // Existing firmware has 1 ms phase resolution
 
 // --- Helper Functions ---
 const shiftAndAppend = (arr: Float64Array, newVals: number[]) => {
@@ -29,10 +33,28 @@ const shiftAndAppendSingle = (arr: Float64Array, val: number) => {
   arr[arr.length - 1] = val;
 };
 
+const medianOf = (values: number[]) => {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+};
+
+const getStimTiming = (frequencyHz: number, dutyPercent: number) => {
+  const periodMs = Math.max(2, Math.round(1000 / frequencyHz));
+  if (dutyPercent === 0) {
+    return { periodMs, pulseMs: 0, offMs: periodMs };
+  }
+
+  const pulseMs = Math.max(1, Math.min(periodMs - 1, Math.round(periodMs * dutyPercent / 100)));
+  return { periodMs, pulseMs, offMs: periodMs - pulseMs };
+};
+
 export default function App() {
   // BLE State
   const [device, setDevice] = useState<BluetoothDevice | null>(null);
-  const [rxChar, setRxChar] = useState<BluetoothRemoteGATTCharacteristic | null>(null);
+  const rxCharRef = useRef<BluetoothRemoteGATTCharacteristic | null>(null);
   const [status, setStatus] = useState<string>("Disconnected");
   const [serviceUuid, setServiceUuid] = useState(SERVICE_UUID);
   const [btError, setBtError] = useState<string | null>(null);
@@ -41,6 +63,8 @@ export default function App() {
   const [uiTemp, setUiTemp] = useState<string>("--");
   const [uiSpo2, setUiSpo2] = useState<string>("--");
   const [uiHr, setUiHr] = useState<string>("--");
+  const [uiHrv, setUiHrv] = useState<string>("--");
+  const [uiHrvQuality, setUiHrvQuality] = useState<string>("等待信号");
   
   // Chart State
   const [chartData, setChartData] = useState({ ppg: [] as any[], trend: [] as any[], stim: [] as any[] });
@@ -54,6 +78,8 @@ export default function App() {
   const irFiltBuf = useRef(new Float64Array(MAX_SAMPLES).fill(NaN));
   const redRawBuf = useRef(new Float64Array(MAX_SAMPLES).fill(NaN));
   const redFiltBuf = useRef(new Float64Array(MAX_SAMPLES).fill(NaN));
+  const hrvTimeBuf = useRef(new Float64Array(HRV_SAMPLES).fill(NaN));
+  const hrvIrFiltBuf = useRef(new Float64Array(HRV_SAMPLES).fill(NaN));
   
   const trendTimeBuf = useRef(new Float64Array(TREND_SAMPLES).fill(NaN));
   const spo2Buf = useRef(new Float64Array(TREND_SAMPLES).fill(NaN));
@@ -74,18 +100,22 @@ export default function App() {
     ir: new FilterChain(0.5, 3.0, FS, 4),
     red: new FilterChain(0.5, 3.0, FS, 4)
   });
+  const hrvFilter = useRef(new FilterChain(0.5, 3.0, FS, 4));
 
   // Stimulation State
   const [powerOn, setPowerOn] = useState(false);
-  const [stimPw, setStimPw] = useState(500);
-  const [stimOff, setStimOff] = useState(500);
+  const [stimFrequency, setStimFrequency] = useState(1);
+  const [stimDutyCycle, setStimDutyCycle] = useState(50);
   const [stimTotal, setStimTotal] = useState(10);
   const stimState = useRef({
     active: false,
     pending: false,
     stopPending: false,
-    startTime: 0,
-    totalTime: 0,
+    startTimeSec: 0,
+    wallStartTimeMs: 0,
+    totalTimeMs: 0,
+    periodMs: 1000,
+    onTimeMs: 500,
     events: [] as any[][] // [event_type, time]
   });
 
@@ -104,6 +134,7 @@ export default function App() {
   // Smoothing
   const emaSpo2 = useRef<number | null>(null);
   const emaHr = useRef<number | null>(null);
+  const hrvDisplayHistory = useRef<{ value: number; timeSeconds: number }[]>([]);
   const signalValid = useRef(false);
 
   useEffect(() => {
@@ -206,8 +237,7 @@ export default function App() {
   useEffect(() => {
     const interval = setInterval(() => {
       if (stimState.current.active) {
-        const now = Date.now() / 1000;
-        if (now - stimState.current.startTime >= stimState.current.totalTime) {
+        if (Date.now() - stimState.current.wallStartTimeMs >= stimState.current.totalTimeMs) {
           stopStimulation();
         }
       }
@@ -216,12 +246,14 @@ export default function App() {
   }, []);
 
   const sendCommand = async (cmdData: Uint8Array) => {
-    if (!rxChar) return;
+    if (!rxCharRef.current) return false;
     try {
-      await rxChar.writeValue(cmdData);
+      await rxCharRef.current.writeValue(cmdData);
       console.log("Sent command bytes:", cmdData);
+      return true;
     } catch (e) {
       console.error("Send error:", e);
+      return false;
     }
   };
 
@@ -232,30 +264,63 @@ export default function App() {
   };
 
   const startStimulation = async () => {
-    if (!rxChar) return;
-    const stimTotalMs = stimTotal * 1000;
+    if (!rxCharRef.current) return;
+    if (
+      !Number.isFinite(stimFrequency) ||
+      stimFrequency < MIN_STIM_FREQUENCY_HZ ||
+      stimFrequency > MAX_STIM_FREQUENCY_HZ
+    ) {
+      alert(`Frequency must be between ${MIN_STIM_FREQUENCY_HZ} and ${MAX_STIM_FREQUENCY_HZ} Hz.`);
+      return;
+    }
+    if (!Number.isInteger(stimDutyCycle) || stimDutyCycle < 0 || stimDutyCycle > 99) {
+      alert("Duty cycle must be an integer from 0 to 99%.");
+      return;
+    }
+    if (!Number.isFinite(stimTotal) || stimTotal <= 0) {
+      alert("Total time must be greater than 0 seconds.");
+      return;
+    }
+
+    const stimTotalMs = Math.round(stimTotal * 1000);
+    const { periodMs, pulseMs, offMs } = getStimTiming(stimFrequency, stimDutyCycle);
+
+    // The unchanged firmware briefly raises the GPIO even for a zero-length
+    // pulse, so 0% duty is represented safely by an explicit stop command.
+    if (stimDutyCycle === 0) {
+      if (!(await sendCommand(new Uint8Array([0x03])))) return;
+      stimState.current.active = false;
+      stimState.current.pending = false;
+      stimState.current.stopPending = false;
+      return;
+    }
+
     const buffer = new ArrayBuffer(13);
     const view = new DataView(buffer);
     view.setUint8(0, 0x02);
-    view.setUint32(1, stimPw, true);
-    view.setUint32(5, stimOff, true);
+    view.setUint32(1, pulseMs, true);
+    view.setUint32(5, offMs, true);
     view.setUint32(9, stimTotalMs, true);
     
-    await sendCommand(new Uint8Array(buffer));
+    if (!(await sendCommand(new Uint8Array(buffer)))) return;
     stimState.current = {
       active: false,
       pending: true,
       stopPending: false,
-      startTime: 0,
-      totalTime: stimTotalMs,
+      startTimeSec: 0,
+      wallStartTimeMs: Date.now(),
+      totalTimeMs: stimTotalMs,
+      periodMs,
+      onTimeMs: pulseMs,
       events: stimState.current.events
     };
   };
 
   const stopStimulation = async () => {
-    if (!rxChar) return;
-    await sendCommand(new Uint8Array([0x03]));
-    stimState.current.stopPending = true;
+    if (!rxCharRef.current) return;
+    if (await sendCommand(new Uint8Array([0x03]))) {
+      stimState.current.stopPending = true;
+    }
   };
 
   const connectDevice = async () => {
@@ -275,7 +340,8 @@ export default function App() {
       dev.addEventListener('gattserverdisconnected', () => {
         setStatus("Disconnected");
         setDevice(null);
-        setRxChar(null);
+        rxCharRef.current = null;
+        setPowerOn(false);
         setIsRecording(false);
         isRecordingRef.current = false;
         syncTimeFlag.current = true; // Reset time sync for next connection
@@ -297,7 +363,7 @@ export default function App() {
       const rx = await service.getCharacteristic(RX_CHAR_UUID);
       const tx = await service.getCharacteristic(TX_CHAR_UUID);
 
-      setRxChar(rx);
+      rxCharRef.current = rx;
       
       await tx.startNotifications();
       tx.addEventListener('characteristicvaluechanged', handleData);
@@ -393,6 +459,7 @@ export default function App() {
     // Filtering
     let irFiltBatch = filters.current.ir.process(irRawBatch);
     let redFiltBatch = filters.current.red.process(redRawBatch);
+    let hrvIrFiltBatch = hrvFilter.current.process(irRawBatch);
 
     if (!irFiltBatch.every(Number.isFinite)) {
       const f = filters.current.ir;
@@ -404,6 +471,10 @@ export default function App() {
       filters.current.red = new FilterChain(f.hpCutoff, f.lpCutoff, f.fs, f.order);
       redFiltBatch = Array.from(redRawBatch);
     }
+    if (!hrvIrFiltBatch.every(Number.isFinite)) {
+      hrvFilter.current = new FilterChain(0.5, 3.0, FS, 4);
+      hrvIrFiltBatch = new Array(BATCH_SIZE).fill(NaN);
+    }
 
     // Update Buffers
     shiftAndAppend(timeBuf.current, tBatch);
@@ -411,6 +482,8 @@ export default function App() {
     shiftAndAppend(irFiltBuf.current, irFiltBatch);
     shiftAndAppend(redRawBuf.current, redRawBatch);
     shiftAndAppend(redFiltBuf.current, redFiltBatch);
+    shiftAndAppend(hrvTimeBuf.current, tBatch);
+    shiftAndAppend(hrvIrFiltBuf.current, hrvIrFiltBatch);
 
     const tLast = tBatch[BATCH_SIZE - 1];
     shiftAndAppendSingle(trendTimeBuf.current, tLast);
@@ -420,7 +493,7 @@ export default function App() {
     const stimCsvChunk = new Array(BATCH_SIZE).fill(0);
     
     if (stimState.current.pending) {
-      stimState.current.startTime = t0_sec;
+      stimState.current.startTimeSec = t0_sec;
       stimState.current.active = true;
       stimState.current.pending = false;
       stimState.current.events.push(["Start", t0_sec]);
@@ -435,13 +508,15 @@ export default function App() {
     if (stimState.current.active) {
       for (let i = 0; i < BATCH_SIZE; i++) {
         const t_sec = tBatch[i];
-        const elapsed_ms = (t_sec - stimState.current.startTime) * 1000.0;
-        if (elapsed_ms >= 0 && elapsed_ms < stimState.current.totalTime) {
-          const cycle = stimPw + stimOff;
-          if ((elapsed_ms % cycle) < stimPw) {
+        const elapsed_ms = (t_sec - stimState.current.startTimeSec) * 1000.0;
+        if (elapsed_ms >= 0 && elapsed_ms < stimState.current.totalTimeMs) {
+          if (
+            stimState.current.onTimeMs > 0 &&
+            (elapsed_ms % stimState.current.periodMs) < stimState.current.onTimeMs
+          ) {
             stimCsvChunk[i] = 1.0;
           }
-        } else if (elapsed_ms >= stimState.current.totalTime) {
+        } else if (elapsed_ms >= stimState.current.totalTimeMs) {
           if (stimState.current.active) {
             stimState.current.active = false;
             stimState.current.events.push(["Stop (Auto)", t_sec]);
@@ -459,8 +534,8 @@ export default function App() {
       let currentValid = false;
       
       const calcLen = 5 * FS; // 5 seconds
-      const recentIrRaw = Array.from(irRawBuf.current.slice(-calcLen));
-      const recentRedRaw = Array.from(redRawBuf.current.slice(-calcLen));
+      const recentIrRaw: number[] = Array.from(irRawBuf.current.slice(-calcLen));
+      const recentRedRaw: number[] = Array.from(redRawBuf.current.slice(-calcLen));
 
       if (!Number.isNaN(recentIrRaw[0]) && !Number.isNaN(recentRedRaw[0])) {
         const recentIrDetrend = detrend(recentIrRaw);
@@ -488,6 +563,8 @@ export default function App() {
         }
       }
       signalValid.current = currentValid;
+
+      const currentHrv = ppgRmssdAnalysis(hrvIrFiltBuf.current, hrvTimeBuf.current, FS);
       
       if (currentValid && emaSpo2.current !== null && emaHr.current !== null) {
         if (emaSpo2.current > 80.0 && obj_temp > 28.0) {
@@ -500,6 +577,28 @@ export default function App() {
       } else {
         setUiSpo2("--");
         setUiHr("--");
+      }
+      if (currentHrv !== null && obj_temp > 28.0) {
+        const recentHistory = hrvDisplayHistory.current.filter(
+          item => tLast - item.timeSeconds <= 5
+        );
+        recentHistory.push({ value: currentHrv.rmssdMs, timeSeconds: tLast });
+        hrvDisplayHistory.current = recentHistory.slice(-3);
+
+        setUiHrv(medianOf(hrvDisplayHistory.current.map(item => item.value)).toFixed(1));
+        const qualityLabel = currentHrv.quality === 'stable'
+          ? '稳定'
+          : currentHrv.quality === 'stabilizing'
+            ? '稳定中'
+            : '初步值';
+        setUiHrvQuality(`${qualityLabel} · ${currentHrv.validIntervalCount} 个间期`);
+      } else {
+        const lastResult = hrvDisplayHistory.current[hrvDisplayHistory.current.length - 1];
+        if (!lastResult || tLast - lastResult.timeSeconds > 5) {
+          hrvDisplayHistory.current = [];
+        }
+        setUiHrv("--");
+        setUiHrvQuality(obj_temp > 28.0 ? "信号不足" : "等待佩戴");
       }
     }
 
@@ -527,7 +626,7 @@ export default function App() {
         ]);
       }
     }
-  }, [stimPw, stimOff]);
+  }, []);
 
   const startRecording = () => {
     if (lastAbsoluteSeq.current === -1) {
@@ -551,12 +650,16 @@ export default function App() {
     samplesSinceCalc.current = 0;
     emaSpo2.current = null;
     emaHr.current = null;
+    hrvDisplayHistory.current = [];
     recordedData.current = [];
     timeBuf.current.fill(NaN);
     irRawBuf.current.fill(NaN);
     irFiltBuf.current.fill(NaN);
     redRawBuf.current.fill(NaN);
     redFiltBuf.current.fill(NaN);
+    hrvTimeBuf.current.fill(NaN);
+    hrvIrFiltBuf.current.fill(NaN);
+    hrvFilter.current = new FilterChain(0.5, 3.0, FS, 4);
     trendTimeBuf.current.fill(NaN);
     spo2Buf.current.fill(NaN);
     tempBuf.current.fill(NaN);
@@ -565,13 +668,18 @@ export default function App() {
     setUiTemp("--");
     setUiSpo2("--");
     setUiHr("--");
+    setUiHrv("--");
+    setUiHrvQuality("等待信号");
     signalValid.current = false;
     stimState.current = {
       active: false,
       pending: false,
       stopPending: false,
-      startTime: 0,
-      totalTime: 0,
+      startTimeSec: 0,
+      wallStartTimeMs: 0,
+      totalTimeMs: 0,
+      periodMs: 1000,
+      onTimeMs: 500,
       events: []
     };
   };
@@ -648,6 +756,18 @@ export default function App() {
     }
   }
 
+  const effectiveStimTiming = Number.isFinite(stimFrequency) &&
+    stimFrequency > 0 &&
+    Number.isFinite(stimDutyCycle) &&
+    stimDutyCycle >= 0 &&
+    stimDutyCycle <= 99
+    ? getStimTiming(stimFrequency, stimDutyCycle)
+    : null;
+  const effectiveStimFrequency = effectiveStimTiming ? 1000 / effectiveStimTiming.periodMs : NaN;
+  const effectiveStimDuty = effectiveStimTiming
+    ? 100 * effectiveStimTiming.pulseMs / effectiveStimTiming.periodMs
+    : NaN;
+
   return (
     <div className="flex flex-col h-[100dvh] bg-slate-50 text-slate-900 font-sans overflow-hidden">
       {/* Header */}
@@ -676,6 +796,14 @@ export default function App() {
         <div className="flex-1 bg-white p-3 rounded-2xl shadow-sm border border-slate-100 min-w-[100px] flex flex-col items-center justify-center">
            <div className="text-[11px] text-slate-400 font-bold uppercase tracking-wider flex items-center gap-1 mb-1"><HeartPulse className="w-3.5 h-3.5"/> HR</div>
            <div className="font-bold text-blue-500 text-xl">{uiHr}<span className="text-sm text-slate-400 ml-0.5">bpm</span></div>
+        </div>
+        <div
+          className="flex-1 bg-white p-3 rounded-2xl shadow-sm border border-slate-100 min-w-[100px] flex flex-col items-center justify-center"
+          title="Rolling PPG-derived pulse-rate variability proxy using RMSSD; not ECG HRV."
+        >
+           <div className="text-[11px] text-slate-400 font-bold uppercase tracking-wider flex items-center gap-1 mb-1"><Activity className="w-3.5 h-3.5"/> HRV/PRV</div>
+           <div className="font-bold text-violet-500 text-xl">{uiHrv}<span className="text-sm text-slate-400 ml-0.5">ms</span></div>
+           <div className="text-[10px] text-slate-400 mt-0.5 whitespace-nowrap">{uiHrvQuality}</div>
         </div>
       </div>
 
@@ -770,14 +898,37 @@ export default function App() {
                 
                 <div className="space-y-4">
                   <div className="flex flex-col space-y-2">
-                    <Label className="text-xs font-bold text-slate-400 uppercase tracking-wider">Pulse Width (ms)</Label>
-                    <Input type="number" value={stimPw} onChange={e => setStimPw(parseInt(e.target.value))} className="text-lg h-12 rounded-xl bg-slate-50 border-slate-200 focus-visible:ring-blue-500" />
+                    <Label className="text-xs font-bold text-slate-400 uppercase tracking-wider">Frequency (Hz)</Label>
+                    <Input
+                      type="number"
+                      min={MIN_STIM_FREQUENCY_HZ}
+                      max={MAX_STIM_FREQUENCY_HZ}
+                      step="0.1"
+                      value={stimFrequency}
+                      onChange={e => setStimFrequency(parseFloat(e.target.value))}
+                      className="text-lg h-12 rounded-xl bg-slate-50 border-slate-200 focus-visible:ring-blue-500"
+                    />
                   </div>
                   
                   <div className="flex flex-col space-y-2">
-                    <Label className="text-xs font-bold text-slate-400 uppercase tracking-wider">Off Width (ms)</Label>
-                    <Input type="number" value={stimOff} onChange={e => setStimOff(parseInt(e.target.value))} className="text-lg h-12 rounded-xl bg-slate-50 border-slate-200 focus-visible:ring-blue-500" />
+                    <Label className="text-xs font-bold text-slate-400 uppercase tracking-wider">Duty Cycle (%)</Label>
+                    <Input
+                      type="number"
+                      min="0"
+                      max="99"
+                      step="1"
+                      value={stimDutyCycle}
+                      onChange={e => setStimDutyCycle(parseInt(e.target.value))}
+                      className="text-lg h-12 rounded-xl bg-slate-50 border-slate-200 focus-visible:ring-blue-500"
+                    />
                   </div>
+
+                  {effectiveStimTiming && (
+                    <p className="text-[11px] text-slate-500 leading-relaxed">
+                      Effective output: {effectiveStimFrequency.toFixed(2)} Hz, {effectiveStimDuty.toFixed(1)}%
+                      ({effectiveStimTiming.pulseMs} ms on / {effectiveStimTiming.offMs} ms off)
+                    </p>
+                  )}
                   
                   <div className="flex flex-col space-y-2">
                     <Label className="text-xs font-bold text-slate-400 uppercase tracking-wider">Total Time (s)</Label>

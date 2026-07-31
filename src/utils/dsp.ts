@@ -135,3 +135,227 @@ export function mean(signal: Float64Array | number[]): number {
   for (let i = 0; i < signal.length; i++) sum += signal[i];
   return sum / signal.length;
 }
+
+function median(values: number[]): number {
+  if (values.length === 0) return NaN;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+}
+
+function quantile(values: number[], q: number): number {
+  if (values.length === 0) return NaN;
+  const sorted = [...values].sort((a, b) => a - b);
+  const position = (sorted.length - 1) * q;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  const fraction = position - lower;
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * fraction;
+}
+
+type PulseIntervalSeries = {
+  intervalsMs: number[];
+  valid: boolean[];
+  artifactRatio: number;
+  coverageSeconds: number;
+};
+
+export type PpgRmssdQuality = 'initial' | 'stabilizing' | 'stable';
+
+export type PpgRmssdResult = {
+  rmssdMs: number;
+  validIntervalCount: number;
+  successivePairCount: number;
+  coverageSeconds: number;
+  artifactRatio: number;
+  quality: PpgRmssdQuality;
+};
+
+function detectPulseFiducials(
+  signal: Float64Array | number[],
+  timeSeconds: Float64Array | number[],
+  fs: number,
+  polarity: 1 | -1,
+): number[] {
+  const n = signal.length;
+  const slope = new Float64Array(n);
+  const slopeValues = new Array<number>(Math.max(0, n - 2));
+
+  for (let i = 1; i < n - 1; i++) {
+    const value = polarity * (signal[i + 1] - signal[i - 1]) * 0.5;
+    slope[i] = value;
+    slopeValues[i - 1] = value;
+  }
+
+  const slopeMedian = median(slopeValues);
+  const absoluteDeviations = slopeValues.map(value => Math.abs(value - slopeMedian));
+  const robustSigma = 1.4826 * median(absoluteDeviations);
+  if (!Number.isFinite(robustSigma) || robustSigma <= 0) return [];
+
+  // A robust, amplitude-independent threshold. The refractory interval below
+  // removes secondary PPG features such as the dicrotic notch.
+  const threshold = slopeMedian + 0.5 * robustSigma;
+  const minDistanceSamples = Math.max(1, Math.floor(fs * 60 / 220));
+  const candidates: { index: number; strength: number }[] = [];
+
+  for (let i = 2; i < n - 2; i++) {
+    const value = slope[i];
+    if (value < threshold || value <= slope[i - 1] || value < slope[i + 1]) continue;
+
+    const last = candidates[candidates.length - 1];
+    if (last && i - last.index < minDistanceSamples) {
+      if (value > last.strength) candidates[candidates.length - 1] = { index: i, strength: value };
+    } else {
+      candidates.push({ index: i, strength: value });
+    }
+  }
+
+  return candidates.map(({ index }) => {
+    // Parabolic interpolation reduces the 10 ms quantisation error at 100 Hz.
+    const y1 = slope[index - 1];
+    const y2 = slope[index];
+    const y3 = slope[index + 1];
+    const denominator = y1 - 2 * y2 + y3;
+    const offsetSamples = denominator === 0
+      ? 0
+      : Math.max(-0.5, Math.min(0.5, 0.5 * (y1 - y3) / denominator));
+    return timeSeconds[index] + offsetSamples / fs;
+  });
+}
+
+function evaluatePulseIntervals(fiducials: number[]): PulseIntervalSeries | null {
+  if (fiducials.length < 3) return null;
+
+  const intervalsMs = new Array<number>(fiducials.length - 1);
+  const physiological = new Array<boolean>(intervalsMs.length);
+  const minIntervalMs = 60_000 / 220;
+  const maxIntervalMs = 60_000 / 40;
+
+  for (let i = 0; i < intervalsMs.length; i++) {
+    const interval = (fiducials[i + 1] - fiducials[i]) * 1000;
+    intervalsMs[i] = interval;
+    physiological[i] = interval >= minIntervalMs && interval <= maxIntervalMs;
+  }
+
+  const valid = new Array<boolean>(intervalsMs.length).fill(false);
+  for (let i = 0; i < intervalsMs.length; i++) {
+    if (!physiological[i]) continue;
+
+    const local = intervalsMs
+      .slice(Math.max(0, i - 5), Math.min(intervalsMs.length, i + 6))
+      .filter((_, localIndex) => physiological[Math.max(0, i - 5) + localIndex]);
+    const localMedian = median(local);
+    const localMad = median(local.map(value => Math.abs(value - localMedian)));
+    const localIqr = quantile(local, 0.75) - quantile(local, 0.25);
+    // IQR keeps legitimate alternating respiratory variation from being
+    // rejected when MAD collapses to zero, while isolated peak-detection
+    // errors still fall outside the local distribution.
+    const toleranceMs = Math.max(0.2 * localMedian, 3 * 1.4826 * localMad, 1.5 * localIqr);
+    valid[i] = Math.abs(intervalsMs[i] - localMedian) <= toleranceMs;
+  }
+
+  const validCount = valid.filter(Boolean).length;
+  return {
+    intervalsMs,
+    valid,
+    artifactRatio: 1 - validCount / intervalsMs.length,
+    coverageSeconds: fiducials[fiducials.length - 1] - fiducials[0],
+  };
+}
+
+/**
+ * Estimates ultra-short, PPG-derived pulse-rate variability using RMSSD.
+ *
+ * RMSSD = sqrt(mean((NN[i + 1] - NN[i])^2)).
+ *
+ * PPG pulse intervals are not ECG R-R intervals, so this result is a PRV
+ * surrogate. The function intentionally returns null instead of a number when
+ * the record is incomplete or contains enough gaps/artifacts to bias RMSSD.
+ */
+export function ppgRmssdAnalysis(
+  signalWindow: Float64Array | number[],
+  timeSeconds: Float64Array | number[],
+  fs: number,
+): PpgRmssdResult | null {
+  if (signalWindow.length !== timeSeconds.length) return null;
+
+  let firstFiniteIndex = 0;
+  while (
+    firstFiniteIndex < signalWindow.length &&
+    (!Number.isFinite(signalWindow[firstFiniteIndex]) || !Number.isFinite(timeSeconds[firstFiniteIndex]))
+  ) {
+    firstFiniteIndex++;
+  }
+
+  const signal = Array.from(signalWindow).slice(firstFiniteIndex);
+  const time = Array.from(timeSeconds).slice(firstFiniteIndex);
+  const n = signal.length;
+  if (n < 3) return null;
+
+  for (let i = 0; i < n; i++) {
+    if (!Number.isFinite(signal[i]) || !Number.isFinite(time[i])) return null;
+  }
+
+  const observedDuration = time[n - 1] - time[0];
+  const expectedDuration = (n - 1) / fs;
+  if (observedDuration <= 0) return null;
+
+  const missingFraction = Math.max(0, observedDuration - expectedDuration) / observedDuration;
+  if (missingFraction > 0.05) return null;
+  if (!checkSignalQuality(signal, fs)) return null;
+
+  const positive = evaluatePulseIntervals(detectPulseFiducials(signal, time, fs, 1));
+  const negative = evaluatePulseIntervals(detectPulseFiducials(signal, time, fs, -1));
+  const candidates = [positive, negative].filter((candidate): candidate is PulseIntervalSeries => candidate !== null);
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => {
+    if (a.artifactRatio !== b.artifactRatio) return a.artifactRatio - b.artifactRatio;
+    return b.coverageSeconds - a.coverageSeconds;
+  });
+  const best = candidates[0];
+
+  // RMSSD becomes mathematically available once three valid pulse fiducials
+  // provide two consecutive intervals. Keep physiological/artifact screening,
+  // but do not delay an otherwise computable value.
+  const validIntervalCount = best.valid.filter(Boolean).length;
+  if (validIntervalCount < 2 || best.artifactRatio > 0.2) return null;
+
+  let squaredDifferenceSum = 0;
+  let successivePairCount = 0;
+  for (let i = 1; i < best.intervalsMs.length; i++) {
+    if (!best.valid[i - 1] || !best.valid[i]) continue;
+    const difference = best.intervalsMs[i] - best.intervalsMs[i - 1];
+    squaredDifferenceSum += difference * difference;
+    successivePairCount++;
+  }
+
+  if (successivePairCount < 1) return null;
+  const rmssd = Math.sqrt(squaredDifferenceSum / successivePairCount);
+  if (!Number.isFinite(rmssd)) return null;
+
+  const quality: PpgRmssdQuality = best.coverageSeconds < 10
+    ? 'initial'
+    : best.coverageSeconds < 25 || best.artifactRatio > 0.1
+      ? 'stabilizing'
+      : 'stable';
+
+  return {
+    rmssdMs: rmssd,
+    validIntervalCount,
+    successivePairCount,
+    coverageSeconds: best.coverageSeconds,
+    artifactRatio: best.artifactRatio,
+    quality,
+  };
+}
+
+export function ppgRmssdEstimation(
+  signalWindow: Float64Array | number[],
+  timeSeconds: Float64Array | number[],
+  fs: number,
+): number | null {
+  return ppgRmssdAnalysis(signalWindow, timeSeconds, fs)?.rmssdMs ?? null;
+}
