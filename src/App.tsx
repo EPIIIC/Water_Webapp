@@ -62,7 +62,8 @@ export default function App() {
   const elapsedMs = progress?.elapsedMs ?? 0;
   const progressPercent = totalMs > 0 ? Math.min(100, elapsedMs / totalMs * 100) : 0;
   // The device is polled once per second. Round up so 0 s means time has elapsed.
-  const remainingText = Math.ceil(Math.max(0, totalMs - elapsedMs) / 1000).toString();
+  const remainingSeconds = Math.ceil(Math.max(0, totalMs - elapsedMs) / 1000);
+  const remainingText = `${String(Math.floor(remainingSeconds / 60)).padStart(2, '0')}:${String(remainingSeconds % 60).padStart(2, '0')}`;
   const indicators = deviceStatus?.indicators ?? DEFAULT_INDICATORS;
   const indicatorControlsEnabled = connected && !!deviceStatus?.indicators && !busy && deviceStatus.state !== DeviceState.Fault;
 
@@ -157,10 +158,10 @@ export default function App() {
               </CardHeader>
               <CardContent className="min-h-0 overflow-y-auto space-y-3 px-4 py-3 sm:px-4 sm:py-3">
                 <div className="space-y-2">
-                  <div className="grid grid-cols-[100px_minmax(0,1fr)] sm:grid-cols-[112px_minmax(0,1fr)] gap-3 items-center">
+                  <div className="grid grid-cols-[minmax(0,1.4fr)_minmax(108px,1fr)] gap-2 items-center">
                     <div role="progressbar" aria-label="Session time" aria-valuemin={0} aria-valuemax={100}
-                      aria-valuenow={Math.round(progressPercent)} aria-valuetext={`${remainingText} s remaining`}
-                      className="relative aspect-square w-full">
+                      aria-valuenow={Math.round(progressPercent)} aria-valuetext={`${remainingText} remaining`}
+                      className="relative aspect-square w-full max-w-[200px] mx-auto">
                       <svg viewBox="0 0 100 100" className="w-full h-full -rotate-90" aria-hidden="true">
                         <circle cx="50" cy="50" r="42" fill="none" stroke="currentColor" strokeWidth="7" className="text-slate-100" />
                         <circle cx="50" cy="50" r="42" fill="none" stroke="currentColor" strokeWidth="7" strokeLinecap="round"
@@ -168,15 +169,15 @@ export default function App() {
                           opacity={progressPercent > 0 ? 1 : 0}
                           className={`transition-[stroke-dashoffset] duration-500 motion-reduce:transition-none ${!connected ? 'text-slate-300' : progressPercent === 100 ? 'text-emerald-500' : 'text-blue-500'}`} />
                       </svg>
-                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-0.5">
-                        <span className="text-[9px] font-medium text-slate-400">Remaining</span>
-                        <span className="text-xl font-semibold tabular-nums text-slate-700">{remainingText}<span className="ml-0.5 text-xs font-normal text-slate-400">s</span></span>
+                      <div className="absolute inset-0 flex flex-col items-center justify-center gap-1">
+                        <span className="text-[11px] font-medium text-slate-400">Time Remaining</span>
+                        <span className="text-3xl font-semibold tabular-nums text-slate-700">{remainingText}</span>
                       </div>
                     </div>
-                    <div className="min-w-0 px-3 divide-y divide-slate-200" role="group" aria-label="LED indicators">
+                    <div className="min-w-0 px-1 divide-y divide-slate-200" role="group" aria-label="LED indicators">
                       {([{ key: 'powerLed', label: 'Power', led: 'LED1' },
                         { key: 'stimulationLed', label: 'Stimulation', led: 'LED2' }] as const).map(item => (
-                        <div key={item.key} className="flex min-w-0 items-center justify-between gap-1.5 py-3">
+                        <div key={item.key} className="flex min-w-0 items-center justify-between gap-1 py-1.5">
                           <div className="min-w-0">
                             <div className="text-[9px] font-medium text-slate-400">{item.led}</div>
                             <div className="text-[11px] font-semibold text-slate-700">{item.label}</div>
