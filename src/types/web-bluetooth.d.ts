@@ -1,5 +1,7 @@
 interface BluetoothRemoteGATTCharacteristic extends EventTarget {
-  writeValue(value: BufferSource): Promise<void>;
+  readonly value?: DataView;
+  writeValueWithResponse(value: BufferSource): Promise<void>;
+  readValue(): Promise<DataView>;
   startNotifications(): Promise<BluetoothRemoteGATTCharacteristic>;
 }
 
@@ -15,6 +17,8 @@ interface BluetoothRemoteGATTServer {
 }
 
 interface BluetoothDevice extends EventTarget {
+  readonly id: string;
+  readonly name?: string;
   gatt?: BluetoothRemoteGATTServer;
 }
 
@@ -27,6 +31,7 @@ interface BluetoothRequestDeviceOptions {
 
 interface Bluetooth {
   requestDevice(options: BluetoothRequestDeviceOptions): Promise<BluetoothDevice>;
+  getDevices?(): Promise<BluetoothDevice[]>;
 }
 
 interface Navigator {
