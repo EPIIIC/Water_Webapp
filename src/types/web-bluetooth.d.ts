@@ -26,7 +26,14 @@ type BluetoothServiceUUID = number | string;
 
 interface BluetoothRequestDeviceOptions {
   acceptAllDevices?: boolean;
+  filters?: BluetoothLEScanFilter[];
   optionalServices?: BluetoothServiceUUID[];
+}
+
+interface BluetoothLEScanFilter {
+  name?: string;
+  namePrefix?: string;
+  services?: BluetoothServiceUUID[];
 }
 
 interface Bluetooth {
