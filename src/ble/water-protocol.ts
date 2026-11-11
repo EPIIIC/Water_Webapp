@@ -1,11 +1,14 @@
 export const SERVICE_UUID = '12345678-1234-5678-1234-56789abcdef0';
 export const TX_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef1';
 export const RX_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef2';
+export const CALIBRATION_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef3';
 
 export const WATER_PACKET_MARKER = 0xa2;
 export const WATER_PROTOCOL_VERSION = 2;
 export const WATER_PACKET_SIZE = 20;
 export const WATER_COMMAND_MARKER = 0xc1;
+export const TDS_CALIBRATION_MIN_MG_L = -500;
+export const TDS_CALIBRATION_MAX_MG_L = 500;
 
 export const VALID_CELL = 1 << 0;
 export const VALID_TDS = 1 << 1;
@@ -66,4 +69,19 @@ export function encodeWaterCommand(command: WaterCommand): Uint8Array {
     throw new Error('Unknown Water command.');
   }
   return new Uint8Array([WATER_COMMAND_MARKER, command]);
+}
+
+export function decodeTdsCalibration(value: DataView): number {
+  if (value.byteLength !== 2) throw new Error('Malformed TDS calibration value.');
+  return value.getInt16(0, true);
+}
+
+export function encodeTdsCalibration(value: number): Uint8Array {
+  if (!Number.isInteger(value) || value < TDS_CALIBRATION_MIN_MG_L ||
+      value > TDS_CALIBRATION_MAX_MG_L) {
+    throw new Error(`TDS calibration must be an integer from ${TDS_CALIBRATION_MIN_MG_L} to ${TDS_CALIBRATION_MAX_MG_L} mg/L.`);
+  }
+  const bytes = new Uint8Array(2);
+  new DataView(bytes.buffer).setInt16(0, value, true);
+  return bytes;
 }

@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
-  Activity, Bluetooth, Download, Droplets, Gauge, Leaf, Pause,
-  Power, Radio, Thermometer, Waves,
+  Activity, Bluetooth, ChartNoAxesCombined, Download, Droplets, Gauge, Leaf, Pause,
+  Power, Radio, Settings2, SlidersHorizontal, Thermometer, Trash2, Waves,
 } from 'lucide-react';
 import {
   CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
 import { WaterClient } from './ble/water-client';
 import {
+  TDS_CALIBRATION_MAX_MG_L, TDS_CALIBRATION_MIN_MG_L,
   VALID_CELL, VALID_TEMPERATURE, WaterCommand,
   type WaterMeasurement, type WaterMode,
 } from './ble/water-protocol';
@@ -24,25 +25,34 @@ type PlotPoint = {
 };
 
 const RECENT_WINDOW_SECONDS = 10;
+const ULTRALOW_WINDOW_SECONDS = 30 * 60;
 const MAX_HISTORY_POINTS = 3600;
+type AppPage = 'monitor' | 'settings';
 
 export default function WaterApp() {
   const [status, setStatus] = useState('Disconnected');
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [points, setPoints] = useState<PlotPoint[]>([]);
   const [latest, setLatest] = useState<WaterMeasurement | null>(null);
   const [fullHistory, setFullHistory] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [page, setPage] = useState<AppPage>('monitor');
+  const [tdsCalibration, setTdsCalibration] = useState(100);
+  const [tdsCalibrationDraft, setTdsCalibrationDraft] = useState('100');
   const clientRef = useRef<WaterClient | null>(null);
+  const plotOriginRef = useRef<number | null>(null);
 
   const acceptMeasurement = (measurement: WaterMeasurement) => {
+    if (plotOriginRef.current === null) {
+      plotOriginRef.current = measurement.timestampSeconds;
+    }
+    const relativeTime = Math.max(0, measurement.timestampSeconds - plotOriginRef.current);
     const key = `${measurement.sessionId}:${measurement.timestampSeconds}`;
     const point: PlotPoint = {
       key,
       session: measurement.sessionId,
-      time: measurement.timestampSeconds,
+      time: relativeTime,
       cell: measurement.validFlags & VALID_CELL ? measurement.cellVoltageMv / 1000 : null,
       // Plot TDS during bring-up even when firmware quality flags it invalid.
       tds: measurement.tdsMgL,
@@ -65,15 +75,21 @@ export default function WaterApp() {
   useEffect(() => {
     const client = new WaterClient({
       link: (label, isConnected) => {
-        // Every BLE link transition starts with a clean plotting session.
-        setPoints([]);
-        setLatest(null);
+        /* Ultra Low intentionally disconnects after every sample.  Preserve
+         * that logical monitoring session across automatic GATT reconnects;
+         * a user-initiated connection starts a new plot in connect().
+         */
         setStatus(label);
         setConnected(isConnected);
         setConnecting(false);
       },
       measurement: acceptMeasurement,
-      error: setError,
+      calibration: value => {
+        setTdsCalibration(value);
+        setTdsCalibrationDraft(String(value));
+      },
+      // Bluetooth lifecycle details stay in the compact Settings status only.
+      error: () => undefined,
     }, navigator.bluetooth);
     clientRef.current = client;
     void client.restore();
@@ -88,8 +104,8 @@ export default function WaterApp() {
       clientRef.current?.disconnect();
       return;
     }
+    clearData();
     setConnecting(true);
-    setError(null);
     try {
       await clientRef.current?.connect();
     } catch {
@@ -99,11 +115,10 @@ export default function WaterApp() {
 
   const send = async (command: WaterCommand) => {
     setBusy(true);
-    setError(null);
     try {
       await clientRef.current?.command(command);
-    } catch (commandError) {
-      setError((commandError as Error).message);
+    } catch {
+      // The compact connection status is sufficient for command failures.
     } finally {
       setBusy(false);
     }
@@ -112,22 +127,53 @@ export default function WaterApp() {
   const visiblePoints = useMemo(() => {
     if (fullHistory || points.length === 0) return points;
     const newest = points.at(-1)!.time;
-    return points.filter(point => point.time >= newest - RECENT_WINDOW_SECONDS);
-  }, [fullHistory, points]);
+    const windowSeconds = latest?.mode === 'ultralow' ?
+      ULTRALOW_WINDOW_SECONDS : RECENT_WINDOW_SECONDS;
+    return points.filter(point => point.time >= newest - windowSeconds);
+  }, [fullHistory, latest?.mode, points]);
+
+  const ocvUpperLimit = useMemo(() => {
+    const maximumOcv = visiblePoints.reduce((maximum, point) =>
+      point.cell === null ? maximum : Math.max(maximum, point.cell), 0);
+    return maximumOcv > 1 ? maximumOcv + 0.3 : 1;
+  }, [visiblePoints]);
 
   const mode: WaterMode = latest?.mode ?? 'normal';
   const purificationOn = latest?.purificationOn ?? true;
   const packetError = latest?.errorFlags ?? 0;
+  const calibrationDraftValue = Number(tdsCalibrationDraft);
+  const calibrationDraftValid = tdsCalibrationDraft.trim() !== '' &&
+    Number.isInteger(calibrationDraftValue) &&
+    calibrationDraftValue >= TDS_CALIBRATION_MIN_MG_L &&
+    calibrationDraftValue <= TDS_CALIBRATION_MAX_MG_L;
+
+  const clearData = () => {
+    plotOriginRef.current = null;
+    setPoints([]);
+    setLatest(null);
+  };
+
+  const applyTdsCalibration = async () => {
+    if (!calibrationDraftValid) return;
+    setBusy(true);
+    try {
+      await clientRef.current?.setTdsCalibration(calibrationDraftValue);
+    } catch {
+      // Do not interrupt the monitor with a Bluetooth alert banner.
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const exportCsv = () => {
     const rows = [
-      'session,timestamp_s,cell_voltage_v,tds_mg_l,temperature_c,mode,purification,valid_flags,error_flags',
-      ...points.map(point => {
-        const value = point.measurement;
-        return [value.sessionId, value.timestampSeconds,
-          point.cell ?? '', point.tds ?? '', point.temperature ?? '', value.mode,
-          value.purificationOn ? 'on' : 'off', value.validFlags, value.errorFlags].join(',');
-      }),
+      'time_s,ocv_v,tds_mg_l,temperature_c',
+      ...points.map(point => [
+        point.time,
+        point.cell ?? '',
+        point.tds ?? '',
+        point.temperature ?? '',
+      ].join(',')),
     ];
     const url = URL.createObjectURL(new Blob([rows.join('\n')], { type: 'text/csv;charset=utf-8' }));
     const link = document.createElement('a');
@@ -141,15 +187,12 @@ export default function WaterApp() {
     <div className="min-h-[100dvh] bg-slate-50 font-sans text-slate-900">
       <header className="sticky top-0 z-20 border-b border-slate-200/70 bg-white/90 backdrop-blur-xl">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
-          <div>
-            <h1 className="flex items-center gap-2 text-lg font-bold tracking-tight">
-              <span className="flex h-9 w-9 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-500 to-teal-400 text-white shadow-sm">
-                <Droplets className="h-5 w-5" />
-              </span>
-              Water Purification
-            </h1>
-            <p className="ml-11 -mt-1 text-[10px] font-bold uppercase tracking-[0.18em] text-slate-400">Realtime water monitor</p>
-          </div>
+          <h1 className="flex items-center gap-2 text-lg font-bold tracking-tight">
+            <span className="flex h-9 w-9 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-500 to-teal-400 text-white shadow-sm">
+              <Droplets className="h-5 w-5" />
+            </span>
+            Water Purification
+          </h1>
           <Button
             variant={connected ? 'outline' : 'default'} disabled={connecting}
             onClick={() => void connect()}
@@ -161,9 +204,9 @@ export default function WaterApp() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl space-y-3 p-3 sm:p-4">
-        <div className="grid grid-cols-3 gap-2 sm:gap-3">
-          <Metric icon={<Waves />} label="Cell Voltage"
+      <main className="mx-auto max-w-6xl space-y-2.5 p-2.5 pb-20 sm:space-y-3 sm:p-4 sm:pb-20">
+        <div className={page === 'monitor' ? 'grid grid-cols-3 gap-2 sm:gap-3' : 'hidden'}>
+          <Metric icon={<Waves />} label="OCV"
             value={latest && latest.validFlags & VALID_CELL ? (latest.cellVoltageMv / 1000).toFixed(3) : '--'}
             unit="V" color="text-blue-600" />
           <Metric icon={<Gauge />} label="TDS"
@@ -174,11 +217,11 @@ export default function WaterApp() {
             unit="°C" color="text-amber-500" />
         </div>
 
-        <Card className="overflow-hidden rounded-2xl border-slate-200/70 shadow-sm">
+        <Card className={`${page === 'settings' ? 'block' : 'hidden'} overflow-hidden rounded-2xl border-slate-200/70 shadow-sm`}>
           <div className="flex flex-wrap items-center justify-between gap-3 p-3 sm:p-4">
             <div className="flex items-center gap-2">
               <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ${connected ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>
-                {connected ? <Radio className="h-3 w-3" /> : <Pause className="h-3 w-3" />}{connected ? status : points.length ? 'Paused' : status}
+                {connected ? <Radio className="h-3 w-3" /> : <Pause className="h-3 w-3" />}{status}
               </span>
               <span className="text-xs text-slate-400">{points.length} records</span>
               {packetError !== 0 && <span className="rounded-full bg-amber-50 px-2 py-1 text-[10px] font-bold text-amber-700">Sensor flag 0x{packetError.toString(16).padStart(2, '0')}</span>}
@@ -199,26 +242,71 @@ export default function WaterApp() {
               </button>
             </div>
           </div>
+          <div className="flex items-center justify-between gap-3 border-t border-slate-100 bg-slate-50/60 px-3 py-3 sm:px-4">
+            <div className="flex min-w-0 items-center gap-2.5">
+              <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-teal-50 text-teal-600">
+                <SlidersHorizontal className="h-4 w-4" />
+              </span>
+              <div className="min-w-0">
+                <div className="text-xs font-bold text-slate-700">Calibration</div>
+                <div className="text-[10px] text-slate-400">TDS offset · −500 to +500 mg/L</div>
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <div className={`flex h-9 items-center rounded-xl border bg-white px-2 shadow-sm ${calibrationDraftValid ? 'border-slate-200' : 'border-red-300'}`}>
+                <input
+                  aria-label="TDS calibration offset"
+                  type="number"
+                  min={TDS_CALIBRATION_MIN_MG_L}
+                  max={TDS_CALIBRATION_MAX_MG_L}
+                  step={1}
+                  value={tdsCalibrationDraft}
+                  disabled={!connected || busy}
+                  onChange={event => setTdsCalibrationDraft(event.target.value)}
+                  className="w-16 bg-transparent text-right text-xs font-bold tabular-nums text-teal-700 outline-none disabled:text-slate-400"
+                />
+                <span className="ml-1 text-[10px] font-semibold text-slate-400">mg/L</span>
+              </div>
+              <button
+                type="button"
+                disabled={!connected || busy || !calibrationDraftValid || calibrationDraftValue === tdsCalibration}
+                onClick={() => void applyTdsCalibration()}
+                className="h-9 rounded-xl bg-teal-600 px-3 text-[11px] font-bold text-white transition hover:bg-teal-700 disabled:bg-slate-200 disabled:text-slate-400"
+              >
+                Apply
+              </button>
+            </div>
+          </div>
         </Card>
 
-        {error && <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"><strong>Bluetooth: </strong>{error}</div>}
-
-        <div className="grid gap-3 lg:grid-cols-3">
-          <ChartCard title="Cell Voltage" subtitle="Open-circuit voltage" unit="V" dataKey="cell" color="#2563eb" icon={<Activity />} data={visiblePoints} yDomain={[0, 1]} />
-          <ChartCard title="TDS" subtitle="Temperature-compensated" unit="mg/L" dataKey="tds" color="#0d9488" icon={<Leaf />} data={visiblePoints} yDomain={[50, 800]} />
-          <ChartCard title="Temperature" subtitle="Pt1000 CVD" unit="°C" dataKey="temperature" color="#f59e0b" icon={<Thermometer />} data={visiblePoints} yDomain={[100, 150]} />
+        <div className={page === 'monitor' ? 'grid gap-2.5 sm:gap-3 lg:grid-cols-3' : 'hidden'}>
+          <ChartCard title="Open Circuit Voltage" unit="V" dataKey="cell" color="#2563eb" icon={<Activity />} data={visiblePoints} yDomain={[0, ocvUpperLimit]} />
+          <ChartCard title="TDS" unit="mg/L" dataKey="tds" color="#0d9488" icon={<Leaf />} data={visiblePoints} yDomain={[50, 800]} />
+          <ChartCard title="Temperature" unit="°C" dataKey="temperature" color="#f59e0b" icon={<Thermometer />} data={visiblePoints} yDomain={[100, 150]} />
         </div>
 
-        <div className="flex items-center justify-between rounded-2xl border border-slate-200/70 bg-white px-4 py-3 shadow-sm">
-          <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600">
+        <div className={`${page === 'settings' ? 'flex' : 'hidden'} flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-200/70 bg-white px-4 py-3 shadow-sm`}>
+          <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600">
             <input type="checkbox" checked={fullHistory} onChange={event => setFullHistory(event.target.checked)} className="h-4 w-4 accent-blue-600" />
-            Show full history <span className="font-normal text-slate-400">(default: latest 10 s)</span>
+            Show full history <span className="font-normal text-slate-400">(default: {mode === 'ultralow' ? 'latest 30 min' : 'latest 10 s'})</span>
           </label>
-          <button onClick={exportCsv} disabled={!points.length} className="inline-flex items-center gap-1.5 text-xs font-bold text-blue-600 disabled:text-slate-300">
-            <Download className="h-4 w-4" />CSV
-          </button>
+          <div className="flex shrink-0 items-center gap-3">
+            <button onClick={clearData} disabled={!points.length} className="inline-flex items-center gap-1.5 text-xs font-bold text-red-500 disabled:text-slate-300">
+              <Trash2 className="h-4 w-4" />Clear
+            </button>
+            <button onClick={exportCsv} disabled={!points.length} className="inline-flex items-center gap-1.5 text-xs font-bold text-blue-600 disabled:text-slate-300">
+              <Download className="h-4 w-4" />CSV
+            </button>
+          </div>
         </div>
       </main>
+
+      <nav className="fixed inset-x-0 bottom-0 z-30 border-t border-slate-200/80 bg-white/95 px-4 pb-[calc(env(safe-area-inset-bottom)+0.5rem)] pt-2 shadow-[0_-8px_24px_rgba(15,23,42,0.06)] backdrop-blur-xl">
+        <div className="mx-auto grid max-w-sm grid-cols-2 gap-2">
+          <NavButton active={page === 'monitor'} icon={<ChartNoAxesCombined />} label="Monitor" onClick={() => setPage('monitor')} />
+          <NavButton active={page === 'settings'} icon={<Settings2 />} label="Settings" onClick={() => setPage('settings')} />
+        </div>
+      </nav>
     </div>
   );
 }
@@ -234,40 +322,57 @@ function Metric({ icon, label, value, unit, color }: { icon: ReactNode; label: s
   );
 }
 
-function ChartCard({ title, subtitle, unit, dataKey, color, icon, data, yDomain }: {
-  title: string; subtitle: string; unit: string; dataKey: 'cell' | 'tds' | 'temperature';
+function ChartCard({ title, unit, dataKey, color, icon, data, yDomain }: {
+  title: string; unit: string; dataKey: 'cell' | 'tds' | 'temperature';
   color: string; icon: ReactNode; data: PlotPoint[];
   yDomain: [number | 'auto', number | 'auto'];
 }) {
-  const hasData = data.some(point => point[dataKey] !== null);
   const latestValue = data.slice().reverse().find(point => point[dataKey] !== null)?.[dataKey];
   return (
     <Card className="overflow-hidden rounded-2xl border-slate-200/60 shadow-sm">
-      <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50/50 px-4 py-3">
-        <div>
-          <h2 className="flex items-center gap-1.5 text-sm font-bold text-slate-800"><span style={{ color }} className="inline-flex h-4 w-4 shrink-0 items-center justify-center [&>svg]:h-4 [&>svg]:w-4">{icon}</span>{title}</h2>
-          <p className="mt-0.5 text-[10px] font-semibold uppercase tracking-wide text-slate-400">{subtitle}</p>
-        </div>
+      <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50/50 px-3 py-2">
+        <h2 className="flex items-center gap-1.5 text-xs font-bold text-slate-800 sm:text-sm"><span style={{ color }} className="inline-flex h-4 w-4 shrink-0 items-center justify-center [&>svg]:h-4 [&>svg]:w-4">{icon}</span>{title}</h2>
         <span className="rounded-full bg-white px-2 py-1 text-xs font-bold tabular-nums shadow-sm" style={{ color }}>
           {latestValue === null || latestValue === undefined ? '--' : latestValue.toFixed(dataKey === 'tds' ? 0 : 2)} <span className="text-[9px] text-slate-400">{unit}</span>
         </span>
       </div>
-      <div className="h-56 p-2">
-        {hasData ? (
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={data} margin={{ top: 8, right: 10, bottom: 2, left: -8 }}>
-              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-              <XAxis dataKey="time" type="number" domain={['dataMin', 'dataMax']} tick={{ fontSize: 9, fill: '#94a3b8' }} tickFormatter={value => `${Math.round(Number(value))}s`} axisLine={false} tickLine={false} />
-              <YAxis domain={yDomain} width={48} tick={{ fontSize: 9, fill: '#94a3b8' }} tickFormatter={value => Number(value).toFixed(dataKey === 'cell' ? 2 : 0)} axisLine={false} tickLine={false} />
-              <Tooltip formatter={value => [`${Number(value).toFixed(dataKey === 'cell' || dataKey === 'temperature' ? 2 : 0)} ${unit}`, title]} labelFormatter={value => `${Math.round(Number(value))} s`} />
-              <Line type="linear" dataKey={dataKey} stroke={color} dot={false} connectNulls={false} isAnimationActive={false} strokeWidth={2} />
-            </LineChart>
-          </ResponsiveContainer>
-        ) : (
-          <div className="flex h-full items-center justify-center text-center text-xs text-slate-400">Waiting for a valid {title.toLowerCase()} sample…</div>
-        )}
+      <div className="h-36 p-1.5 sm:h-40 sm:p-2">
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={data} margin={{ top: 6, right: 8, bottom: 0, left: -8 }}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+            <XAxis dataKey="time" type="number" domain={['dataMin', 'dataMax']} tick={{ fontSize: 9, fill: '#94a3b8' }} tickFormatter={value => `${Math.round(Number(value))}s`} axisLine={false} tickLine={false} />
+            <YAxis domain={yDomain} width={48} tick={{ fontSize: 9, fill: '#94a3b8' }} tickFormatter={value => Number(value).toFixed(dataKey === 'cell' ? 2 : 0)} axisLine={false} tickLine={false} />
+            <Tooltip formatter={value => [`${Number(value).toFixed(dataKey === 'cell' || dataKey === 'temperature' ? 2 : 0)} ${unit}`, title]} labelFormatter={value => `${Math.round(Number(value))} s`} />
+            <Line
+              type="linear"
+              dataKey={dataKey}
+              stroke={color}
+              dot={{ r: 2.5, fill: color, stroke: '#ffffff', strokeWidth: 1 }}
+              activeDot={{ r: 4, fill: color, stroke: '#ffffff', strokeWidth: 1.5 }}
+              connectNulls={false}
+              isAnimationActive={false}
+              strokeWidth={2}
+            />
+          </LineChart>
+        </ResponsiveContainer>
       </div>
     </Card>
+  );
+}
+
+function NavButton({ active, icon, label, onClick }: {
+  active: boolean; icon: ReactNode; label: string; onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-current={active ? 'page' : undefined}
+      className={`flex h-11 items-center justify-center gap-2 rounded-2xl text-xs font-bold transition ${active ? 'bg-blue-50 text-blue-600' : 'text-slate-400 hover:bg-slate-50 hover:text-slate-600'}`}
+    >
+      <span className="inline-flex h-4 w-4 items-center justify-center [&>svg]:h-4 [&>svg]:w-4">{icon}</span>
+      {label}
+    </button>
   );
 }
 

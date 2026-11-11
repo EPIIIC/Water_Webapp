@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  decodeWaterMeasurement, encodeWaterCommand, WaterCommand,
+  decodeTdsCalibration, decodeWaterMeasurement, encodeTdsCalibration, encodeWaterCommand, WaterCommand,
   WATER_COMMAND_MARKER, WATER_PACKET_SIZE,
 } from './water-protocol';
 
@@ -53,4 +53,13 @@ test('encodes the two-byte RX command', () => {
     [WATER_COMMAND_MARKER, WaterCommand.PurificationOff]);
   assert.deepEqual([...encodeWaterCommand(WaterCommand.IenOn)],
     [WATER_COMMAND_MARKER, WaterCommand.IenOn]);
+});
+
+test('encodes and decodes signed TDS calibration', () => {
+  for (const calibration of [-500, -25, 0, 100, 500]) {
+    const encoded = encodeTdsCalibration(calibration);
+    assert.equal(decodeTdsCalibration(new DataView(encoded.buffer)), calibration);
+  }
+  assert.throws(() => encodeTdsCalibration(501), /integer from/);
+  assert.throws(() => encodeTdsCalibration(1.5), /integer from/);
 });
